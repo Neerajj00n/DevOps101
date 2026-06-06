@@ -1,0 +1,232 @@
+# EC2 — Elastic Compute Cloud
+
+EC2 is AWS's virtual machine service. It is the foundation of most AWS architectures — even if you eventually move to containers, you are almost always running on EC2 nodes underneath.
+
+---
+
+## Core Concepts
+
+**AMI (Amazon Machine Image)** — The template for your instance. Think of it as a snapshot of an OS + software. AWS provides Amazon Linux, Ubuntu, RHEL, Windows. You can also create your own.
+
+**Instance Type** — Defines CPU, memory, and network. Format: `family.size` (e.g. `t3.medium`, `c6i.xlarge`, `r7g.2xlarge`)
+
+| Family | Use Case |
+|--------|----------|
+| t3/t4g | General purpose, burstable (dev/test, small workloads) |
+| m6i/m7i | General purpose, steady (web servers, app servers) |
+| c6i/c7i | Compute optimized (CI runners, batch processing) |
+| r6i/r7i | Memory optimized (databases, caches) |
+| p/g | GPU (ML training, inference) |
+
+**Key Pair** — SSH public/private key pair. AWS stores the public key, you keep the private key. Without it you cannot SSH in.
+
+**Security Group** — A virtual firewall. Controls inbound and outbound traffic at the instance level. Stateful — if you allow inbound on port 80, the response traffic is automatically allowed outbound.
+
+**EBS (Elastic Block Store)** — Persistent disk attached to your instance. Survives instance stops/restarts (unlike instance store which is ephemeral).
+
+---
+
+## Launching an Instance via CLI
+
+```bash
+# Find the latest Ubuntu 22.04 AMI in your region
+aws ec2 describe-images \
+  --owners 099720109477 \
+  --filters "Name=name,Values=ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*" \
+  --query 'sort_by(Images, &CreationDate)[-1].ImageId' \
+  --output text
+
+# Launch an instance
+aws ec2 run-instances \
+  --image-id ami-0xxxxxxxxxxxxxxxx \
+  --instance-type t3.micro \
+  --key-name my-keypair \
+  --security-group-ids sg-0xxxxxxxxxxxxxxxx \
+  --subnet-id subnet-0xxxxxxxxxxxxxxxx \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=web-01}]' \
+  --count 1
+
+# Check it is running
+aws ec2 describe-instances \
+  --filters "Name=tag:Name,Values=web-01" \
+  --query 'Reservations[*].Instances[*].[InstanceId,State.Name,PublicIpAddress]' \
+  --output table
+```
+
+---
+
+## Connecting to Instances
+
+```bash
+# Standard SSH (key pair)
+ssh -i ~/.ssh/mykey.pem ubuntu@<public-ip>
+
+# SSH via SSM (no public IP needed, no open port 22)
+aws ssm start-session --target i-1234567890abcdef0
+
+# SSH tunnel through SSM (port forwarding)
+aws ssm start-session \
+  --target i-1234567890abcdef0 \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["5432"],"localPortNumber":["5432"]}'
+```
+
+SSM Session Manager is the modern way to access instances. No bastion host needed, no port 22 open, full audit trail in CloudTrail.
+
+---
+
+## Security Groups
+
+```bash
+# Create a security group
+aws ec2 create-security-group \
+  --group-name web-sg \
+  --description "Web server security group" \
+  --vpc-id vpc-0xxxxxxxxxxxxxxxx
+
+# Allow HTTP from anywhere
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0xxxxxxxxxxxxxxxx \
+  --protocol tcp \
+  --port 80 \
+  --cidr 0.0.0.0/0
+
+# Allow SSH from your IP only
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0xxxxxxxxxxxxxxxx \
+  --protocol tcp \
+  --port 22 \
+  --cidr $(curl -s ifconfig.me)/32
+
+# Allow traffic from another security group (common for DB → App)
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-db-id \
+  --protocol tcp \
+  --port 5432 \
+  --source-group sg-app-id
+
+# List rules for a group
+aws ec2 describe-security-groups \
+  --group-ids sg-0xxxxxxxxxxxxxxxx \
+  --query 'SecurityGroups[0].IpPermissions' \
+  --output table
+```
+
+---
+
+## Instance Lifecycle
+
+```bash
+# Stop (preserves EBS, stops billing for compute)
+aws ec2 stop-instances --instance-ids i-xxxxxxxx
+
+# Start
+aws ec2 start-instances --instance-ids i-xxxxxxxx
+
+# Reboot (stays running, OS-level restart)
+aws ec2 reboot-instances --instance-ids i-xxxxxxxx
+
+# Terminate (DELETES the instance and root EBS by default)
+aws ec2 terminate-instances --instance-ids i-xxxxxxxx
+
+# Protect from accidental termination
+aws ec2 modify-instance-attribute \
+  --instance-id i-xxxxxxxx \
+  --disable-api-termination
+```
+
+---
+
+## User Data — Bootstrap Scripts
+
+User data runs once when the instance first launches. Use it to install software, pull configs, register with a service.
+
+```bash
+aws ec2 run-instances \
+  --image-id ami-0xxxxxxxxxxxxxxxx \
+  --instance-type t3.micro \
+  --user-data file://bootstrap.sh \
+  ...
+```
+
+```bash
+# bootstrap.sh
+#!/bin/bash
+set -euxo pipefail
+
+apt-get update -y
+apt-get install -y nginx
+systemctl enable nginx
+systemctl start nginx
+
+echo "Server: $(hostname)" > /var/www/html/index.html
+```
+
+Logs from user data: `/var/log/cloud-init-output.log`
+
+---
+
+## EBS Volumes
+
+```bash
+# List volumes
+aws ec2 describe-volumes \
+  --query 'Volumes[*].[VolumeId,Size,State,Attachments[0].InstanceId]' \
+  --output table
+
+# Create and attach an extra volume
+aws ec2 create-volume \
+  --size 50 \
+  --volume-type gp3 \
+  --availability-zone ap-south-1a
+
+aws ec2 attach-volume \
+  --volume-id vol-xxxxxxxx \
+  --instance-id i-xxxxxxxx \
+  --device /dev/xvdf
+
+# On the instance — format and mount it
+sudo mkfs.ext4 /dev/xvdf
+sudo mkdir /data
+sudo mount /dev/xvdf /data
+# Add to /etc/fstab for persistence across reboots
+echo "/dev/xvdf /data ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab
+```
+
+**Volume types:**
+- `gp3` — general purpose SSD, baseline 3000 IOPS. Default choice.
+- `io2` — provisioned IOPS SSD, for databases needing consistent high IOPS.
+- `st1` — throughput optimized HDD, for big sequential reads (logs, data lakes).
+
+---
+
+## Instance Metadata Service (IMDS)
+
+From inside an EC2 instance, you can query metadata about the instance itself.
+
+```bash
+# Get instance ID
+curl http://169.254.169.254/latest/meta-data/instance-id
+
+# Get current region
+curl http://169.254.169.254/latest/meta-data/placement/region
+
+# Get IAM role credentials (IMDSv1 — avoid in production)
+curl http://169.254.169.254/latest/meta-data/iam/security-credentials/
+
+# IMDSv2 — token-based, more secure (use this)
+TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+curl -H "X-aws-ec2-metadata-token: $TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id
+```
+
+Always enforce IMDSv2 in production. Set `HttpTokens=required` when launching instances.
+
+---
+
+## Key Insight for DevOps
+
+Security groups are the most common source of "why can't my app connect to X" in AWS. Before assuming it's an application problem, always verify the security group allows the traffic on the exact port and from the exact source. Use `nc -zv hostname port` from inside the instance to test.
+
+Never open port 22 to `0.0.0.0/0` in production. Use SSM Session Manager instead — it requires no inbound ports and gives you a full audit trail.

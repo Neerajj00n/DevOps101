@@ -1,0 +1,170 @@
+# AWS CLI & Console Basics
+
+Before you touch any AWS service, get comfortable with two things: the Console for exploration, and the CLI for everything you'll actually automate.
+
+---
+
+## Installing & Configuring the CLI
+
+```bash
+# Install (Linux)
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip awscliv2.zip && sudo ./aws/install
+
+# Verify
+aws --version
+
+# Configure default profile
+aws configure
+# AWS Access Key ID:     AKIA...
+# AWS Secret Access Key: xxxxxxxx
+# Default region:        ap-south-1       ← set your closest region
+# Default output format: json             ← or 'table' for readability
+```
+
+Credentials are stored in `~/.aws/credentials`, config in `~/.aws/config`.
+
+---
+
+## Named Profiles — Working With Multiple Accounts
+
+You will almost always have more than one AWS account (dev, staging, prod, personal). Named profiles keep them separate.
+
+```bash
+# Add a named profile
+aws configure --profile prod
+
+# Use a specific profile for any command
+aws s3 ls --profile prod
+aws ec2 describe-instances --profile dev
+
+# Set a default for the current shell session
+export AWS_PROFILE=prod
+
+# Check which identity you are currently using
+aws sts get-caller-identity
+aws sts get-caller-identity --profile prod
+```
+
+Output of `get-caller-identity`:
+```json
+{
+    "UserId": "AIDA...",
+    "Account": "123456789012",
+    "Arn": "arn:aws:iam::123456789012:user/joon"
+}
+```
+
+Run this every time before doing something destructive. Saves you from applying prod changes in the wrong account.
+
+---
+
+## CLI Output Formats
+
+```bash
+# JSON (default) — best for scripting
+aws ec2 describe-instances --output json
+
+# Table — best for reading in terminal
+aws ec2 describe-instances --output table
+
+# Text — best for piping to awk/grep
+aws ec2 describe-instances --output text
+
+# YAML — useful for readability
+aws ec2 describe-instances --output yaml
+```
+
+---
+
+## Querying Output with --query
+
+The `--query` flag uses JMESPath to filter JSON output. Essential for scripting.
+
+```bash
+# Get only instance IDs and states
+aws ec2 describe-instances \
+  --query 'Reservations[*].Instances[*].[InstanceId,State.Name]' \
+  --output table
+
+# Get the public IP of a specific instance
+aws ec2 describe-instances \
+  --instance-ids i-1234567890abcdef0 \
+  --query 'Reservations[0].Instances[0].PublicIpAddress' \
+  --output text
+
+# List all S3 buckets by name only
+aws s3api list-buckets --query 'Buckets[*].Name' --output text
+
+# Filter: only running instances
+aws ec2 describe-instances \
+  --filters "Name=instance-state-name,Values=running" \
+  --query 'Reservations[*].Instances[*].[InstanceId,InstanceType,PublicIpAddress]' \
+  --output table
+```
+
+---
+
+## Regions
+
+AWS services are regional. Always know which region you are in.
+
+```bash
+# List all regions
+aws ec2 describe-regions --output table
+
+# Set region per command
+aws ec2 describe-instances --region us-east-1
+
+# Set in config
+aws configure set region ap-south-1
+
+# Common regions
+# ap-south-1    → Mumbai
+# us-east-1     → N. Virginia (most services available here first)
+# eu-west-1     → Ireland
+# ap-southeast-1 → Singapore
+```
+
+---
+
+## Pagination
+
+Some commands return paginated results. Use `--no-paginate` to get everything at once, or handle pagination properly in scripts.
+
+```bash
+# Get all EC2 instances regardless of count
+aws ec2 describe-instances --no-paginate
+
+# Manual pagination with next token
+aws ec2 describe-instances --max-items 10
+# Response includes "NextToken" — pass it to get the next page
+aws ec2 describe-instances --max-items 10 --starting-token <NextToken>
+```
+
+---
+
+## Useful General Commands
+
+```bash
+# Check your account ID
+aws sts get-caller-identity --query Account --output text
+
+# List all services you have resources in (rough check)
+aws resourcegroupstaggingapi get-resources --output table
+
+# Check service quotas
+aws service-quotas list-service-quotas --service-code ec2
+
+# Estimate costs for a running resource type
+aws ce get-cost-and-usage \
+  --time-period Start=2024-06-01,End=2024-06-30 \
+  --granularity MONTHLY \
+  --metrics BlendedCost
+```
+
+---
+
+## Key Insight for DevOps
+
+Get comfortable with `--query` early. Every time you find yourself copy-pasting an instance ID from the console, ask yourself: "could I get this with a CLI query?" The answer is almost always yes, and a script that fetches IDs dynamically is much more reusable than one with hardcoded values.

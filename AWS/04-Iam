@@ -1,0 +1,232 @@
+# IAM — Identity & Access Management
+
+IAM controls who can do what in your AWS account. Getting this wrong is how you get breached. Getting it right means even if credentials leak, the blast radius is contained.
+
+The core principle: **least privilege** — every user, role, and service gets only the permissions it actually needs and nothing more.
+
+---
+
+## Core Concepts
+
+**User** — A person or application that has long-term credentials (access key + secret key). Avoid long-term credentials where possible.
+
+**Group** — A collection of users. Attach policies to groups, not individual users.
+
+**Role** — An identity that can be assumed temporarily. No long-term credentials. Used by EC2 instances, Lambda functions, EKS pods, cross-account access. This is the right way to grant permissions to AWS services.
+
+**Policy** — A JSON document defining what actions are allowed or denied on which resources. Attached to users, groups, or roles.
+
+**Trust Policy** — Defines who can *assume* a role. Part of the role, separate from permission policies.
+
+---
+
+## Policy Structure
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowS3ReadOnSpecificBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::my-app-bucket",
+        "arn:aws:s3:::my-app-bucket/*"
+      ]
+    }
+  ]
+}
+```
+
+**Effect**: `Allow` or `Deny`. Explicit Deny always wins.
+**Action**: AWS API calls in format `service:Action`. Use `*` for all (avoid in prod).
+**Resource**: Which specific resources. Use `*` for all (avoid for sensitive services).
+**Condition**: Optional — restrict by IP, MFA, time, tags, etc.
+
+---
+
+## Managing Users & Groups
+
+```bash
+# Create a user
+aws iam create-user --user-name joon-dev
+
+# Create access keys for a user (for CLI use)
+aws iam create-access-key --user-name joon-dev
+# Store the SecretAccessKey — it is only shown once
+
+# Create a group and add user
+aws iam create-group --group-name developers
+aws iam add-user-to-group --group-name developers --user-name joon-dev
+
+# Attach a managed policy to a group
+aws iam attach-group-policy \
+  --group-name developers \
+  --policy-arn arn:aws:iam::aws:policy/ReadOnlyAccess
+
+# List users and their groups
+aws iam list-users --query 'Users[*].[UserName,CreateDate]' --output table
+aws iam list-groups-for-user --user-name joon-dev
+
+# Delete access key (rotate credentials)
+aws iam list-access-keys --user-name joon-dev
+aws iam delete-access-key \
+  --user-name joon-dev \
+  --access-key-id AKIAXXXXXXXXXXXXXXXX
+```
+
+---
+
+## IAM Roles for EC2 (Instance Profiles)
+
+This is how you give an EC2 instance permission to call AWS APIs — without putting credentials on the instance.
+
+```bash
+# 1. Create a policy
+aws iam create-policy \
+  --policy-name app-s3-read \
+  --policy-document file://s3-read-policy.json
+
+# s3-read-policy.json:
+# {
+#   "Version": "2012-10-17",
+#   "Statement": [{
+#     "Effect": "Allow",
+#     "Action": ["s3:GetObject", "s3:ListBucket"],
+#     "Resource": [
+#       "arn:aws:s3:::my-app-bucket",
+#       "arn:aws:s3:::my-app-bucket/*"
+#     ]
+#   }]
+# }
+
+# 2. Create a role with EC2 trust policy
+aws iam create-role \
+  --role-name ec2-app-role \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "ec2.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+# 3. Attach the policy to the role
+aws iam attach-role-policy \
+  --role-name ec2-app-role \
+  --policy-arn arn:aws:iam::ACCOUNT_ID:policy/app-s3-read
+
+# 4. Create an instance profile and add the role
+aws iam create-instance-profile --instance-profile-name ec2-app-profile
+aws iam add-role-to-instance-profile \
+  --instance-profile-name ec2-app-profile \
+  --role-name ec2-app-role
+
+# 5. Launch EC2 with this profile
+aws ec2 run-instances \
+  --iam-instance-profile Name=ec2-app-profile \
+  ...
+
+# 6. Verify from inside the instance
+aws s3 ls s3://my-app-bucket   # should work without any credentials configured
+aws sts get-caller-identity    # shows the assumed role
+```
+
+---
+
+## IAM Roles for Services (Cross-Service)
+
+```bash
+# Role for Lambda to write to DynamoDB
+aws iam create-role \
+  --role-name lambda-dynamo-role \
+  --assume-role-policy-document '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": {"Service": "lambda.amazonaws.com"},
+      "Action": "sts:AssumeRole"
+    }]
+  }'
+
+# Always attach CloudWatch Logs for Lambda (needed to see logs)
+aws iam attach-role-policy \
+  --role-name lambda-dynamo-role \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+```
+
+---
+
+## Writing Good Policies
+
+```json
+// Too permissive — do not do this
+{
+  "Effect": "Allow",
+  "Action": "s3:*",
+  "Resource": "*"
+}
+
+// Least privilege — do this
+{
+  "Effect": "Allow",
+  "Action": ["s3:GetObject", "s3:PutObject"],
+  "Resource": "arn:aws:s3:::my-app-bucket/uploads/*"
+}
+
+// With condition — restrict to specific IP range
+{
+  "Effect": "Allow",
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::my-app-bucket/*",
+  "Condition": {
+    "IpAddress": {
+      "aws:SourceIp": ["203.0.113.0/24"]
+    }
+  }
+}
+```
+
+---
+
+## Policy Simulator
+
+Test policies before applying them:
+
+```bash
+# Simulate whether a user can perform an action
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::ACCOUNT_ID:user/joon-dev \
+  --action-names s3:GetObject \
+  --resource-arns arn:aws:s3:::my-app-bucket/file.txt
+```
+
+Or use the IAM Policy Simulator in the console — it is one of the most useful debugging tools in AWS.
+
+---
+
+## Common Managed Policies
+
+```
+arn:aws:iam::aws:policy/ReadOnlyAccess            → read everything, change nothing
+arn:aws:iam::aws:policy/AmazonS3FullAccess        → full S3
+arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess   → read EC2
+arn:aws:iam::aws:policy/AmazonEKSClusterPolicy    → EKS cluster operations
+arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy → EKS node group
+arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy → CloudWatch agent on EC2
+```
+
+---
+
+## Key Insight for DevOps
+
+Never use your root account for anything except billing. Create an admin IAM user on day one, enable MFA on both root and admin, then never touch root again.
+
+Never put access keys directly on EC2 instances, in code, or in environment variables if you can use an instance role instead. Credentials in code get committed to git. Credentials on instances get leaked via SSRF vulnerabilities. Roles have no long-term secret to steal.
+
+The first sign of a breach in many AWS accounts is unexpected API calls in CloudTrail. Enable CloudTrail in every region, every account, from day one.

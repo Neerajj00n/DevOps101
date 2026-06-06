@@ -1,0 +1,208 @@
+# RDS — Managed Relational Databases
+
+RDS is AWS's managed database service. It handles backups, patching, replication, and failover — things you would otherwise have to manage yourself on an EC2 instance running PostgreSQL or MySQL.
+
+---
+
+## When to Use RDS vs Self-Managed
+
+Use RDS when:
+- You want automated backups and point-in-time recovery
+- You need Multi-AZ failover without building it yourself
+- You want read replicas for scaling reads
+- Your team does not have database administration expertise
+
+Consider self-managed when:
+- You need database versions or extensions RDS does not support
+- You need full OS-level access for tuning
+- Cost is a primary concern at large scale
+
+---
+
+## Supported Engines
+
+- **PostgreSQL** — most common in modern DevOps stacks
+- **MySQL / MariaDB** — widely used, good for web apps
+- **Aurora** — AWS's custom engine, compatible with PostgreSQL or MySQL. Higher performance, higher cost. Serverless option available.
+- **SQL Server / Oracle** — enterprise, license included or BYOL
+
+---
+
+## Creating an RDS Instance
+
+```bash
+# Create a DB subnet group (RDS must span at least 2 AZs)
+aws rds create-db-subnet-group \
+  --db-subnet-group-name prod-db-subnets \
+  --db-subnet-group-description "Production DB subnets" \
+  --subnet-ids subnet-private-a subnet-private-b
+
+# Create a security group for RDS
+aws ec2 create-security-group \
+  --group-name rds-sg \
+  --description "RDS access" \
+  --vpc-id vpc-xxxxxxxx
+
+# Allow access only from app security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-rds-id \
+  --protocol tcp \
+  --port 5432 \
+  --source-group sg-app-id
+
+# Create the RDS instance
+aws rds create-db-instance \
+  --db-instance-identifier prod-postgres \
+  --db-instance-class db.t3.medium \
+  --engine postgres \
+  --engine-version 15.4 \
+  --master-username dbadmin \
+  --master-user-password "UseSecretsManagerInstead" \
+  --allocated-storage 100 \
+  --storage-type gp3 \
+  --db-subnet-group-name prod-db-subnets \
+  --vpc-security-group-ids sg-rds-id \
+  --multi-az \
+  --backup-retention-period 7 \
+  --deletion-protection \
+  --no-publicly-accessible \
+  --storage-encrypted
+
+# Check status
+aws rds describe-db-instances \
+  --db-instance-identifier prod-postgres \
+  --query 'DBInstances[0].[DBInstanceStatus,Endpoint.Address]' \
+  --output table
+```
+
+---
+
+## Key Parameters Explained
+
+**`--multi-az`** — Creates a standby replica in a different AZ. If the primary fails, AWS automatically fails over to the standby (typically ~60 seconds). Always use in production.
+
+**`--no-publicly-accessible`** — RDS is in private subnets and not reachable from the internet. Always set this.
+
+**`--storage-encrypted`** — Encrypts the EBS volume at rest using KMS. Always set this.
+
+**`--deletion-protection`** — Prevents accidental deletion. Always set in production.
+
+**`--backup-retention-period`** — How many days to keep automated backups. 7–35 days. 0 disables backups (dev only).
+
+---
+
+## Connecting to RDS
+
+RDS is in private subnets with no public access. To connect for admin work:
+
+```bash
+# Option 1: From an EC2 instance in the same VPC
+psql -h prod-postgres.xxxxxxxx.ap-south-1.rds.amazonaws.com \
+     -U dbadmin -d myapp
+
+# Option 2: Port forward via SSM (most secure)
+aws ssm start-session \
+  --target i-ec2-instance-id \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["5432"],"localPortNumber":["5432"],"host":["prod-postgres.xxxxxxxx.rds.amazonaws.com"]}'
+
+# Then connect locally
+psql -h localhost -U dbadmin -d myapp
+```
+
+---
+
+## Backups and Snapshots
+
+```bash
+# Manual snapshot (useful before schema changes)
+aws rds create-db-snapshot \
+  --db-instance-identifier prod-postgres \
+  --db-snapshot-identifier before-migration-2024-06-01
+
+# List snapshots
+aws rds describe-db-snapshots \
+  --db-instance-identifier prod-postgres \
+  --query 'DBSnapshots[*].[DBSnapshotIdentifier,SnapshotCreateTime,Status]' \
+  --output table
+
+# Restore from snapshot (creates a NEW instance — does not overwrite existing)
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier restored-postgres \
+  --db-snapshot-identifier before-migration-2024-06-01
+
+# Point-in-time restore (restore to any second within retention window)
+aws rds restore-db-instance-to-point-in-time \
+  --source-db-instance-identifier prod-postgres \
+  --target-db-instance-identifier prod-postgres-restored \
+  --restore-time 2024-06-01T10:30:00Z
+```
+
+---
+
+## Parameter Groups
+
+Tune database settings without modifying the OS.
+
+```bash
+# Create a custom parameter group
+aws rds create-db-parameter-group \
+  --db-parameter-group-name prod-postgres-params \
+  --db-parameter-group-family postgres15 \
+  --description "Production PostgreSQL parameters"
+
+# Modify a parameter
+aws rds modify-db-parameter-group \
+  --db-parameter-group-name prod-postgres-params \
+  --parameters \
+    "ParameterName=max_connections,ParameterValue=500,ApplyMethod=pending-reboot" \
+    "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate"
+
+# Attach to instance
+aws rds modify-db-instance \
+  --db-instance-identifier prod-postgres \
+  --db-parameter-group-name prod-postgres-params \
+  --apply-immediately
+```
+
+Useful parameters to tune: `max_connections`, `shared_buffers`, `log_min_duration_statement` (slow query logging), `work_mem`.
+
+---
+
+## Secrets Manager — Store DB Credentials
+
+Never hardcode database passwords. Use AWS Secrets Manager.
+
+```bash
+# Store RDS credentials
+aws secretsmanager create-secret \
+  --name prod/postgres/credentials \
+  --secret-string '{
+    "username": "dbadmin",
+    "password": "a-real-password",
+    "host": "prod-postgres.xxxxxxxx.rds.amazonaws.com",
+    "port": 5432,
+    "dbname": "myapp"
+  }'
+
+# Enable automatic rotation (RDS integration)
+aws secretsmanager rotate-secret \
+  --secret-id prod/postgres/credentials \
+  --rotation-lambda-arn arn:aws:lambda:... \
+  --rotation-rules AutomaticallyAfterDays=30
+
+# Retrieve in your app (SDK)
+aws secretsmanager get-secret-value \
+  --secret-id prod/postgres/credentials \
+  --query SecretString --output text | jq .
+```
+
+Your application should fetch credentials from Secrets Manager at startup, not read them from environment variables that were set at deploy time.
+
+---
+
+## Key Insight for DevOps
+
+Always take a manual snapshot before any schema migration or major application change. Automated backups are great, but a manual snapshot named `before-feature-x-migration` is much easier to find and restore when something goes wrong at 2am.
+
+Never put RDS in a public subnet with public access enabled. If you need to connect from your laptop, use SSM port forwarding through an EC2 instance. It is slightly less convenient but infinitely more secure.

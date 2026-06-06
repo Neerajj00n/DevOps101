@@ -1,0 +1,222 @@
+# S3 — Simple Storage Service
+
+S3 is object storage. Not a filesystem — you store objects (files) in buckets, access them via HTTP, and they scale infinitely. It is one of AWS's oldest and most reliable services and shows up everywhere: static assets, backups, Terraform state, CI artifacts, logs, ML datasets.
+
+---
+
+## Core Concepts
+
+**Bucket** — A container for objects. Name must be globally unique across all AWS accounts. Tied to a region even though the name is global.
+
+**Object** — A file + metadata. Identified by a key (the "path"), e.g. `uploads/2024/06/image.jpg`. Objects can be up to 5TB.
+
+**Key** — The full path to an object within a bucket. S3 is flat (not a real filesystem), but `/` in key names creates the appearance of folders in the console.
+
+**Storage Classes:**
+
+| Class | Use Case | Retrieval |
+|-------|----------|-----------|
+| S3 Standard | Frequently accessed data | Immediate |
+| S3 Standard-IA | Infrequent access, still fast | Immediate |
+| S3 Glacier Instant | Archives, millisecond retrieval | Immediate |
+| S3 Glacier Flexible | Archives, cheap | Minutes–hours |
+| S3 Intelligent-Tiering | Unknown access pattern | Immediate |
+
+---
+
+## Basic Operations
+
+```bash
+# Create a bucket
+aws s3api create-bucket \
+  --bucket my-app-bucket-joon \
+  --region ap-south-1 \
+  --create-bucket-configuration LocationConstraint=ap-south-1
+# Note: us-east-1 does NOT need --create-bucket-configuration
+
+# List buckets
+aws s3 ls
+
+# List objects in a bucket
+aws s3 ls s3://my-app-bucket-joon
+aws s3 ls s3://my-app-bucket-joon/uploads/ --recursive
+
+# Upload a file
+aws s3 cp myfile.txt s3://my-app-bucket-joon/
+aws s3 cp myfile.txt s3://my-app-bucket-joon/uploads/myfile.txt
+
+# Upload a directory
+aws s3 sync ./dist/ s3://my-app-bucket-joon/frontend/ --delete
+# --delete removes objects in S3 that no longer exist locally
+
+# Download
+aws s3 cp s3://my-app-bucket-joon/myfile.txt ./
+aws s3 sync s3://my-app-bucket-joon/backups/ ./local-backups/
+
+# Delete
+aws s3 rm s3://my-app-bucket-joon/myfile.txt
+aws s3 rm s3://my-app-bucket-joon/uploads/ --recursive
+
+# Delete a bucket (must be empty first)
+aws s3 rb s3://my-app-bucket-joon
+aws s3 rb s3://my-app-bucket-joon --force  # empties then deletes
+```
+
+---
+
+## Bucket Policy — Access Control
+
+Block all public access by default (this is now the AWS default):
+
+```bash
+aws s3api put-public-access-block \
+  --bucket my-app-bucket-joon \
+  --public-access-block-configuration \
+    "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
+```
+
+Allow read from specific IAM role only:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AllowAppRoleRead",
+      "Effect": "Allow",
+      "Principal": {
+        "AWS": "arn:aws:iam::ACCOUNT_ID:role/ec2-app-role"
+      },
+      "Action": ["s3:GetObject", "s3:ListBucket"],
+      "Resource": [
+        "arn:aws:s3:::my-app-bucket-joon",
+        "arn:aws:s3:::my-app-bucket-joon/*"
+      ]
+    }
+  ]
+}
+```
+
+```bash
+aws s3api put-bucket-policy \
+  --bucket my-app-bucket-joon \
+  --policy file://bucket-policy.json
+```
+
+---
+
+## Static Website Hosting
+
+```bash
+# Enable website hosting
+aws s3api put-bucket-website \
+  --bucket my-site-bucket \
+  --website-configuration '{
+    "IndexDocument": {"Suffix": "index.html"},
+    "ErrorDocument": {"Key": "404.html"}
+  }'
+
+# For a public site, you need to allow public reads
+# (disable block public access first, then add bucket policy)
+aws s3api put-bucket-policy \
+  --bucket my-site-bucket \
+  --policy '{
+    "Version": "2012-10-17",
+    "Statement": [{
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::my-site-bucket/*"
+    }]
+  }'
+
+# Deploy your site
+aws s3 sync ./build/ s3://my-site-bucket/ --delete
+
+# Access at: http://my-site-bucket.s3-website.ap-south-1.amazonaws.com
+```
+
+For production, put CloudFront in front of S3 — it adds HTTPS, CDN caching, and custom domain support.
+
+---
+
+## Versioning & Lifecycle
+
+```bash
+# Enable versioning
+aws s3api put-bucket-versioning \
+  --bucket my-app-bucket-joon \
+  --versioning-configuration Status=Enabled
+
+# List object versions
+aws s3api list-object-versions \
+  --bucket my-app-bucket-joon \
+  --prefix myfile.txt
+
+# Restore a previous version
+aws s3api get-object \
+  --bucket my-app-bucket-joon \
+  --key myfile.txt \
+  --version-id VERSION_ID \
+  restored-file.txt
+
+# Lifecycle policy — move old objects to cheaper storage
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket my-app-bucket-joon \
+  --lifecycle-configuration '{
+    "Rules": [{
+      "ID": "archive-old-logs",
+      "Status": "Enabled",
+      "Filter": {"Prefix": "logs/"},
+      "Transitions": [
+        {"Days": 30, "StorageClass": "STANDARD_IA"},
+        {"Days": 90, "StorageClass": "GLACIER"}
+      ],
+      "Expiration": {"Days": 365}
+    }]
+  }'
+```
+
+---
+
+## Presigned URLs
+
+Generate a temporary URL that allows someone to access or upload an object without AWS credentials.
+
+```bash
+# Presigned URL valid for 1 hour (download)
+aws s3 presign s3://my-app-bucket-joon/report.pdf --expires-in 3600
+
+# Presigned URL for upload (via SDK — CLI does not support PUT presign directly)
+```
+
+Common use case: your app generates a presigned URL and sends it to a client so they can upload directly to S3 without going through your server.
+
+---
+
+## Terraform State Backend
+
+S3 is the standard backend for Terraform state. You will configure this in the Terraform module.
+
+```hcl
+# backend.tf
+terraform {
+  backend "s3" {
+    bucket         = "my-terraform-state-bucket"
+    key            = "prod/terraform.tfstate"
+    region         = "ap-south-1"
+    encrypt        = true
+    dynamodb_table = "terraform-locks"
+  }
+}
+```
+
+Always enable: versioning (to recover from bad state), encryption, and DynamoDB locking (prevents concurrent applies).
+
+---
+
+## Key Insight for DevOps
+
+S3 is eventually consistent for some operations (though AWS has moved toward strong consistency). For Terraform state, this is why DynamoDB locking matters — without it, two simultaneous `terraform apply` commands can corrupt your state file.
+
+Never store secrets in S3 without encryption. Enable SSE-S3 or SSE-KMS at the bucket level, and for anything sensitive, use SSE-KMS with a dedicated KMS key so you get audit logs of every decryption.

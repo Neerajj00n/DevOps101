@@ -1,0 +1,218 @@
+# VPC — Virtual Private Cloud
+
+A VPC is your private network inside AWS. Everything you deploy lives inside one. Understanding VPC is non-negotiable for DevOps — if you cannot design a proper network, you will spend hours debugging connectivity issues that should take minutes.
+
+---
+
+## Core Concepts
+
+**VPC** — An isolated virtual network. You define the IP address range (CIDR block), e.g. `10.0.0.0/16`. AWS creates a default VPC per region — never use it for anything serious.
+
+**Subnet** — A subdivision of the VPC within a specific Availability Zone. Two types:
+- **Public subnet** — has a route to an Internet Gateway. Resources here can be reached from the internet (if they have a public IP).
+- **Private subnet** — no direct internet route. Resources here are internal only. They reach the internet via NAT Gateway.
+
+**Internet Gateway (IGW)** — Attaches to a VPC and allows traffic to/from the internet. One per VPC.
+
+**NAT Gateway** — Sits in a public subnet. Allows resources in private subnets to make outbound internet requests (software updates, API calls) without being reachable inbound. Has an Elastic IP. Costs money per hour + per GB processed.
+
+**Route Table** — Controls where traffic goes. Every subnet has one. Public subnets route `0.0.0.0/0` to IGW. Private subnets route `0.0.0.0/0` to NAT Gateway.
+
+**Availability Zone (AZ)** — A physically separate data center within a region. Deploy across at least two AZs for high availability.
+
+---
+
+## Standard Production VPC Layout
+
+```
+VPC: 10.0.0.0/16
+│
+├── ap-south-1a
+│   ├── Public Subnet:  10.0.1.0/24  → Route: 0.0.0.0/0 → IGW
+│   └── Private Subnet: 10.0.3.0/24  → Route: 0.0.0.0/0 → NAT GW (AZ-a)
+│
+└── ap-south-1b
+    ├── Public Subnet:  10.0.2.0/24  → Route: 0.0.0.0/0 → IGW
+    └── Private Subnet: 10.0.4.0/24  → Route: 0.0.0.0/0 → NAT GW (AZ-b)
+
+Public subnets:  ALB, NAT Gateways, Bastion hosts (if any)
+Private subnets: EC2 app servers, RDS, ElastiCache, EKS nodes
+```
+
+This is the layout you will use for almost every production system.
+
+---
+
+## Building a VPC from Scratch (CLI)
+
+```bash
+# 1. Create VPC
+VPC_ID=$(aws ec2 create-vpc \
+  --cidr-block 10.0.0.0/16 \
+  --query 'Vpc.VpcId' --output text)
+
+aws ec2 create-tags \
+  --resources $VPC_ID \
+  --tags Key=Name,Value=prod-vpc
+
+# Enable DNS hostnames (needed for many services)
+aws ec2 modify-vpc-attribute \
+  --vpc-id $VPC_ID \
+  --enable-dns-hostnames
+
+# 2. Create subnets
+PUB_SUBNET_A=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.1.0/24 \
+  --availability-zone ap-south-1a \
+  --query 'Subnet.SubnetId' --output text)
+
+PUB_SUBNET_B=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.2.0/24 \
+  --availability-zone ap-south-1b \
+  --query 'Subnet.SubnetId' --output text)
+
+PRIV_SUBNET_A=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.3.0/24 \
+  --availability-zone ap-south-1a \
+  --query 'Subnet.SubnetId' --output text)
+
+PRIV_SUBNET_B=$(aws ec2 create-subnet \
+  --vpc-id $VPC_ID \
+  --cidr-block 10.0.4.0/24 \
+  --availability-zone ap-south-1b \
+  --query 'Subnet.SubnetId' --output text)
+
+# Enable auto-assign public IP for public subnets
+aws ec2 modify-subnet-attribute \
+  --subnet-id $PUB_SUBNET_A --map-public-ip-on-launch
+aws ec2 modify-subnet-attribute \
+  --subnet-id $PUB_SUBNET_B --map-public-ip-on-launch
+
+# 3. Internet Gateway
+IGW_ID=$(aws ec2 create-internet-gateway \
+  --query 'InternetGateway.InternetGatewayId' --output text)
+aws ec2 attach-internet-gateway \
+  --internet-gateway-id $IGW_ID --vpc-id $VPC_ID
+
+# 4. Public route table
+PUB_RT=$(aws ec2 create-route-table \
+  --vpc-id $VPC_ID \
+  --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route \
+  --route-table-id $PUB_RT \
+  --destination-cidr-block 0.0.0.0/0 \
+  --gateway-id $IGW_ID
+
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUBNET_A
+aws ec2 associate-route-table --route-table-id $PUB_RT --subnet-id $PUB_SUBNET_B
+
+# 5. NAT Gateway (in public subnet, with Elastic IP)
+EIP=$(aws ec2 allocate-address \
+  --domain vpc \
+  --query 'AllocationId' --output text)
+
+NAT_GW=$(aws ec2 create-nat-gateway \
+  --subnet-id $PUB_SUBNET_A \
+  --allocation-id $EIP \
+  --query 'NatGateway.NatGatewayId' --output text)
+
+# Wait for NAT GW to be available (takes ~1 minute)
+aws ec2 wait nat-gateway-available --nat-gateway-ids $NAT_GW
+
+# 6. Private route table
+PRIV_RT=$(aws ec2 create-route-table \
+  --vpc-id $VPC_ID \
+  --query 'RouteTable.RouteTableId' --output text)
+
+aws ec2 create-route \
+  --route-table-id $PRIV_RT \
+  --destination-cidr-block 0.0.0.0/0 \
+  --nat-gateway-id $NAT_GW
+
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_SUBNET_A
+aws ec2 associate-route-table --route-table-id $PRIV_RT --subnet-id $PRIV_SUBNET_B
+
+echo "VPC setup complete: $VPC_ID"
+```
+
+---
+
+## CIDR Planning
+
+Plan your CIDR blocks before you build. Overlapping CIDRs break VPC peering and on-premises connectivity.
+
+```
+/16 → 65,534 IPs  (use for VPC)
+/24 → 254 IPs     (use for subnets)
+/28 → 14 IPs      (minimum subnet size, good for VPC endpoints, load balancers)
+
+AWS reserves 5 IPs per subnet:
+  x.x.x.0   → network address
+  x.x.x.1   → VPC router
+  x.x.x.2   → DNS
+  x.x.x.3   → future use
+  x.x.x.255 → broadcast
+So a /24 gives you 251 usable IPs.
+```
+
+---
+
+## VPC Endpoints
+
+VPC Endpoints let services in private subnets talk to AWS services (S3, DynamoDB, SSM, ECR) without going through the NAT Gateway. Saves NAT Gateway data costs and keeps traffic on the AWS network.
+
+```bash
+# S3 Gateway Endpoint (free)
+aws ec2 create-vpc-endpoint \
+  --vpc-id $VPC_ID \
+  --service-name com.amazonaws.ap-south-1.s3 \
+  --vpc-endpoint-type Gateway \
+  --route-table-ids $PRIV_RT
+
+# SSM Interface Endpoint (needed for SSM Session Manager in private subnets)
+aws ec2 create-vpc-endpoint \
+  --vpc-id $VPC_ID \
+  --service-name com.amazonaws.ap-south-1.ssm \
+  --vpc-endpoint-type Interface \
+  --subnet-ids $PRIV_SUBNET_A $PRIV_SUBNET_B \
+  --security-group-ids $SG_ID
+```
+
+---
+
+## Debugging Connectivity
+
+```bash
+# From inside a private instance — can I reach the internet?
+curl https://google.com
+
+# Can I reach another instance by private IP?
+nc -zv 10.0.3.15 8080
+
+# Check route table associations
+aws ec2 describe-route-tables \
+  --filters "Name=vpc-id,Values=$VPC_ID" \
+  --query 'RouteTables[*].[RouteTableId,Associations[*].SubnetId,Routes[*].[DestinationCidrBlock,GatewayId,NatGatewayId]]' \
+  --output table
+
+# VPC Flow Logs — log all traffic in/out of your VPC
+aws ec2 create-flow-logs \
+  --resource-type VPC \
+  --resource-ids $VPC_ID \
+  --traffic-type ALL \
+  --log-destination-type cloud-watch-logs \
+  --log-group-name /aws/vpc/flowlogs \
+  --deliver-logs-permission-arn arn:aws:iam::ACCOUNT_ID:role/flowlogs-role
+```
+
+---
+
+## Key Insight for DevOps
+
+The most common VPC mistake is putting everything in public subnets because it's easier. Do not do this in production. Your databases, app servers, and EKS nodes belong in private subnets. Only load balancers and NAT gateways go in public subnets.
+
+The second most common mistake is forgetting that NAT Gateway costs money. A pair of NAT Gateways (one per AZ for HA) costs around $65/month minimum, plus data transfer. For dev/test, a single NAT Gateway is fine.
