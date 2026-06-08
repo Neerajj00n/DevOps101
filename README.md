@@ -15,3 +15,5 @@ A hands-on, no-fluff path through the foundations of DevOps — Linux, AWS, Terr
 2. AWS or any cloud free tier
 3. Virtual machine on your local — VirtualBox or VMware
 4. Docker Desktop — for the Docker module, and for trying Linux without a VM
+
+![alt text](image.png)
