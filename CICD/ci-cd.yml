@@ -1,0 +1,283 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options: [staging, prod]
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPOSITORY: myapp
+
+# Cancel in-progress runs for the same branch/PR
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+jobs:
+  # ─────────────────────────────────────────
+  # 1. Lint + Test (runs on all events)
+  # ─────────────────────────────────────────
+  lint-and-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm run test:unit -- --coverage
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: coverage
+          path: ./coverage/
+          retention-days: 7
+
+      # Comment coverage summary on PRs
+      - name: PR coverage comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('./coverage/coverage-summary.json', 'utf8');
+            const data = JSON.parse(summary);
+            const pct = data.total.lines.pct;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `### Test Coverage: ${pct}%`
+            });
+
+  # ─────────────────────────────────────────
+  # 2. Build & Push (main branch + tags only)
+  # ─────────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+      image-uri: ${{ steps.meta.outputs.uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: github-${{ github.run_id }}
+
+      - name: Login to ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image metadata
+        id: meta
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          REGISTRY=${{ steps.ecr-login.outputs.registry }}
+
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"          # v1.2.3
+          else
+            TAG="${SHORT_SHA}"
+          fi
+
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "uri=${REGISTRY}/${{ env.ECR_REPOSITORY }}:${TAG}" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Scan base image for vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: node:20-alpine
+          format: table
+          severity: CRITICAL
+          exit-code: 1
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ steps.meta.outputs.tag }}
+            ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_DATE=${{ github.run_id }}
+
+      - name: Scan pushed image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.meta.outputs.uri }}
+          format: sarif
+          output: trivy-results.sarif
+          severity: HIGH,CRITICAL
+
+      - name: Job summary
+        run: |
+          echo "## Image pushed 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "| Key | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| URI | \`${{ steps.meta.outputs.uri }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Tag | \`${{ steps.meta.outputs.tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SHA | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+
+  # ─────────────────────────────────────────
+  # 3. Deploy Staging (auto on main merge)
+  # ─────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS service (staging)
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image-tag }}"
+          ECR_REGISTRY=$(aws ecr describe-repositories \
+            --repository-names ${{ env.ECR_REPOSITORY }} \
+            --query 'repositories[0].repositoryUri' --output text | cut -d/ -f1)
+
+          # Update ECS task definition with new image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition myapp-staging \
+            --query 'taskDefinition' \
+            --output json)
+
+          NEW_TASK_DEF=$(echo $TASK_DEF | jq \
+            --arg IMAGE "${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)')
+
+          NEW_REVISION=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+
+          aws ecs update-service \
+            --cluster staging \
+            --service myapp \
+            --task-definition "$NEW_REVISION" \
+            --force-new-deployment
+
+          echo "Deployed image tag: ${IMAGE_TAG}"
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster staging \
+            --services myapp
+          echo "Staging deployment stable ✓"
+
+      - name: Notify Slack
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          COLOR=$([ "$STATUS" = "success" ] && echo "good" || echo "danger")
+          curl -s -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"text\": \"*Staging deploy ${STATUS}*\nTag: \`${{ needs.build-and-push.outputs.image-tag }}\`\nBy: ${{ github.actor }}\"
+              }]
+            }"
+
+  # ─────────────────────────────────────────
+  # 4. Deploy Prod (manual approval required)
+  # ─────────────────────────────────────────
+  deploy-prod:
+    name: Deploy → Production
+    runs-on: ubuntu-latest
+    needs: [build-and-push, deploy-staging]
+    if: github.ref == 'refs/heads/main'
+    environment: prod     # this environment has required reviewers in GitHub settings
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Update ECS service (prod)
+        run: |
+          IMAGE_TAG="${{ needs.build-and-push.outputs.image-tag }}"
+
+          # Same pattern as staging — update task def and service
+          # ... (abbreviated for readability)
+          echo "Deploying tag ${IMAGE_TAG} to production"
+
+      - name: Wait for deployment
+        run: |
+          aws ecs wait services-stable \
+            --cluster prod \
+            --services myapp
+
+      - name: Notify Slack
+        if: always()
+        run: |
+          STATUS="${{ job.status }}"
+          COLOR=$([ "$STATUS" = "success" ] && echo "good" || echo "danger")
+          curl -s -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-type: application/json' \
+            --data "{
+              \"attachments\": [{
+                \"color\": \"${COLOR}\",
+                \"text\": \"*Production deploy ${STATUS}*\nTag: \`${{ needs.build-and-push.outputs.image-tag }}\`\nBy: ${{ github.actor }}\"
+              }]
+            }"

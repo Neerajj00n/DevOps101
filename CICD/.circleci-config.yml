@@ -1,0 +1,190 @@
+version: 2.1
+
+# ─────────────────────────────────────────
+# Orbs
+# ─────────────────────────────────────────
+orbs:
+  node: circleci/node@5.0
+  aws-cli: circleci/aws-cli@4.0
+
+# ─────────────────────────────────────────
+# Reusable commands
+# ─────────────────────────────────────────
+commands:
+  ecr-login:
+    description: Authenticate Docker with ECR
+    steps:
+      - run:
+          name: Login to ECR
+          command: |
+            aws ecr get-login-password --region $AWS_REGION | \
+              docker login --username AWS --password-stdin \
+              "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+  notify-slack:
+    description: Send Slack notification
+    parameters:
+      status:
+        type: string
+    steps:
+      - run:
+          name: Notify Slack
+          when: always
+          command: |
+            COLOR=$([ "<< parameters.status >>" = "success" ] && echo "good" || echo "danger")
+            curl -s -X POST $SLACK_WEBHOOK \
+              -H 'Content-type: application/json' \
+              --data "{
+                \"attachments\": [{
+                  \"color\": \"${COLOR}\",
+                  \"text\": \"*<< parameters.status >>* | $CIRCLE_PROJECT_REPONAME @ $(git rev-parse --short HEAD)\"
+                }]
+              }"
+
+# ─────────────────────────────────────────
+# Jobs
+# ─────────────────────────────────────────
+jobs:
+  lint-and-test:
+    executor: node/default
+    steps:
+      - checkout
+      - node/install-packages:
+          pkg-manager: npm
+      - run:
+          name: Lint
+          command: npm run lint
+      - run:
+          name: Typecheck
+          command: npm run typecheck
+      - run:
+          name: Unit tests
+          command: npm run test:unit -- --coverage
+      - store_test_results:
+          path: ./test-results
+      - store_artifacts:
+          path: ./coverage
+          destination: coverage
+
+  build-and-push:
+    machine:
+      image: ubuntu-2204:current
+      docker_layer_caching: true   # DLC — faster Docker builds
+    steps:
+      - checkout
+      - aws-cli/setup
+      - ecr-login
+      - run:
+          name: Build and push
+          command: |
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            IMAGE_TAG=$(git rev-parse --short HEAD)
+
+            docker build \
+              --build-arg GIT_SHA=$CIRCLE_SHA1 \
+              --build-arg BUILD_NUM=$CIRCLE_BUILD_NUM \
+              -t $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG \
+              .
+
+            docker push $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG
+
+            docker tag $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG \
+                       $ECR_REGISTRY/$ECR_REPO:latest
+            docker push $ECR_REGISTRY/$ECR_REPO:latest
+
+            echo "Pushed: $ECR_REGISTRY/$ECR_REPO:$IMAGE_TAG"
+            # Save tag for downstream jobs
+            echo "export IMAGE_TAG=$IMAGE_TAG" >> $BASH_ENV
+
+  deploy-staging:
+    docker:
+      - image: cimg/aws:2024.03
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Deploy to staging ECS
+          command: |
+            IMAGE_TAG=$(git rev-parse --short HEAD)
+            ECR_REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+
+            TASK_DEF=$(aws ecs describe-task-definition \
+              --task-definition myapp-staging \
+              --query 'taskDefinition' --output json)
+
+            NEW_TASK_DEF=$(echo $TASK_DEF | jq \
+              --arg IMAGE "${ECR_REGISTRY}/${ECR_REPO}:${IMAGE_TAG}" \
+              '.containerDefinitions[0].image = $IMAGE |
+               del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .placementConstraints, .compatibilities, .registeredAt, .registeredBy)')
+
+            NEW_REVISION=$(aws ecs register-task-definition \
+              --cli-input-json "$NEW_TASK_DEF" \
+              --query 'taskDefinition.taskDefinitionArn' --output text)
+
+            aws ecs update-service \
+              --cluster staging \
+              --service myapp \
+              --task-definition "$NEW_REVISION" \
+              --force-new-deployment
+
+            aws ecs wait services-stable \
+              --cluster staging \
+              --services myapp
+
+            echo "Staging deployment complete: ${IMAGE_TAG}"
+      - notify-slack:
+          status: success
+
+  approve-production:
+    docker:
+      - image: cimg/base:current
+    steps:
+      - run: echo "Waiting for manual approval..."
+
+  deploy-prod:
+    docker:
+      - image: cimg/aws:2024.03
+    steps:
+      - checkout
+      - aws-cli/setup
+      - run:
+          name: Deploy to production ECS
+          command: |
+            IMAGE_TAG=$(git rev-parse --short HEAD)
+            echo "Deploying ${IMAGE_TAG} to production..."
+            # Same pattern as staging — abbreviated for readability
+      - notify-slack:
+          status: success
+
+# ─────────────────────────────────────────
+# Workflow
+# ─────────────────────────────────────────
+workflows:
+  ci-cd:
+    jobs:
+      - lint-and-test
+
+      - build-and-push:
+          requires: [lint-and-test]
+          filters:
+            branches:
+              only: main
+
+      - deploy-staging:
+          requires: [build-and-push]
+          filters:
+            branches:
+              only: main
+
+      - approve-production:
+          type: approval          # human clicks Approve in CircleCI dashboard
+          requires: [deploy-staging]
+          filters:
+            branches:
+              only: main
+
+      - deploy-prod:
+          requires: [approve-production]
+          filters:
+            branches:
+              only: main
